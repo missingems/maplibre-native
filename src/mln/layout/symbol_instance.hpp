@@ -9,7 +9,7 @@
 #include <cstdint>
 
 #ifndef MLN_SYMBOL_GUARDS
-#define MLN_SYMBOL_GUARDS 1
+#define MLN_SYMBOL_GUARDS 0
 #endif
 
 #if MLN_SYMBOL_GUARDS
