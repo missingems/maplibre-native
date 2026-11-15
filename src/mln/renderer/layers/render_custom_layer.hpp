@@ -19,6 +19,12 @@ public:
                 const RenderTree &,
                 UniqueChangeRequestVec &) override;
 
+    /// Whether the host allows this layer to be redrawn over a cached image of the layers below.
+    bool drawsOverCachedMap() const;
+
+    /// Calls the host's pre-render outside of a full layer update.
+    void preRender(gfx::Context &, const PaintParameters &);
+
 private:
     void transition(const TransitionParameters &) override {}
     void evaluate(const PropertyEvaluationParameters &) override;

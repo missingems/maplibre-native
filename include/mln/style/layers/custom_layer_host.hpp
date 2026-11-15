@@ -35,6 +35,12 @@ public:
     virtual void preRender(const mln::gfx::Context&, const mln::style::CustomLayerRenderParameters&) {};
 
     /**
+     * Whether this layer may be redrawn on its own over a cached image of the layers below it.
+     * Only honoured for the run of custom layers at the top of the style. Read after `preRender`.
+     */
+    virtual bool drawsOverCachedMap() { return false; }
+
+    /**
      * Render the layer. This method is called once per frame. The
      * implementation should not make any assumptions about the GL/Metal state (other
      * than that the correct context is active). It may make changes to the

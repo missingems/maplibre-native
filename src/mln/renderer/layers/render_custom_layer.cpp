@@ -102,6 +102,16 @@ void RenderCustomLayer::markContextDestroyed() {
 
 void RenderCustomLayer::prepare(const LayerPrepareParameters&) {}
 
+bool RenderCustomLayer::drawsOverCachedMap() const {
+    return host && !needsInitialize && !contextDestroyed && host->drawsOverCachedMap();
+}
+
+void RenderCustomLayer::preRender(gfx::Context& context, const PaintParameters& paintParameters) {
+    if (host && !needsInitialize) {
+        MBGL_CHECK_ERROR(callPreRender(host, context, paintParameters));
+    }
+}
+
 void RenderCustomLayer::update([[maybe_unused]] gfx::ShaderRegistry& shaders,
                                gfx::Context& context,
                                [[maybe_unused]] const TransformState& state,

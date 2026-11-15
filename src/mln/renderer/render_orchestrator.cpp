@@ -6,6 +6,7 @@
 #include <mln/renderer/renderer_observer.hpp>
 #include <mln/renderer/render_source.hpp>
 #include <mln/renderer/render_layer.hpp>
+#include <mln/renderer/layers/render_custom_layer.hpp>
 #include <mln/renderer/render_static_data.hpp>
 #include <mln/renderer/render_tree.hpp>
 #include <mln/renderer/update_parameters.hpp>
@@ -945,6 +946,33 @@ bool RenderOrchestrator::removeLayerGroup(const LayerGroupBasePtr& layerGroup) {
 
 size_t RenderOrchestrator::numLayerGroups() const noexcept {
     return layerGroupsByLayerIndex.size();
+}
+
+std::optional<int32_t> RenderOrchestrator::cachedMapOverlayIndex() const {
+    std::optional<int32_t> index;
+    for (auto it = orderedLayers.rbegin(); it != orderedLayers.rend(); ++it) {
+        const RenderLayer& layer = it->get();
+        if (layer.baseImpl->getTypeInfo() != style::CustomLayer::Impl::staticTypeInfo()) {
+            // Other layers above the run are redrawn from their retained drawables.
+            continue;
+        }
+        if (!static_cast<const RenderCustomLayer&>(layer).drawsOverCachedMap()) {
+            break;
+        }
+        index = layer.getLayerIndex();
+    }
+    return index;
+}
+
+void RenderOrchestrator::preRenderOverlayLayers(int32_t firstIndex,
+                                                gfx::Context& context,
+                                                const PaintParameters& paintParameters) {
+    for (RenderLayer& layer : orderedLayers) {
+        if (layer.getLayerIndex() >= firstIndex &&
+            layer.baseImpl->getTypeInfo() == style::CustomLayer::Impl::staticTypeInfo()) {
+            static_cast<RenderCustomLayer&>(layer).preRender(context, paintParameters);
+        }
+    }
 }
 
 void RenderOrchestrator::updateLayers(gfx::ShaderRegistry& shaders,

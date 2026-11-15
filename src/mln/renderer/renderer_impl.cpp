@@ -20,12 +20,17 @@
 #include <mln/util/logging.hpp>
 #include <mln/util/instrumentation.hpp>
 
+#include <limits>
+#include <optional>
+
 #include <mln/gfx/drawable_tweaker.hpp>
 #include <mln/renderer/layer_tweaker.hpp>
 #include <mln/renderer/render_target.hpp>
 
 #if MLN_RENDER_BACKEND_METAL
 #include <mln/mtl/renderer_backend.hpp>
+#include <mln/mtl/render_pass.hpp>
+#include <mln/mtl/renderable_resource.hpp>
 #include <Metal/MTLCaptureManager.hpp>
 #include <Metal/MTLCaptureScope.hpp>
 /// Enable programmatic Metal frame captures for specific frame numbers.
@@ -265,6 +270,25 @@ void Renderer::Impl::render(const RenderTree& renderTree, const std::shared_ptr<
 
     orchestrator.processChanges();
 
+    // Decide whether this frame renders the map into the layer cache, with the overlay layers on top of it.
+    std::optional<int32_t> overlayIndex;
+    bool cacheFrame = false;
+#if MLN_RENDER_BACKEND_METAL
+    {
+        using CacheStage = mtl::RenderableResource::LayerCacheStage;
+        auto& resource = backend.getDefaultRenderable().getResource<mtl::RenderableResource>();
+        if (parameters.debugOptions == MapDebugOptions::NoDebug) {
+            overlayIndex = orchestrator.cachedMapOverlayIndex();
+        }
+        cacheFrame = overlayIndex && resource.setLayerCacheStage(CacheStage::Base);
+        if (!cacheFrame) {
+            resource.setLayerCacheStage(CacheStage::None);
+        }
+    }
+    overlayReady = false;
+#endif // MLN_RENDER_BACKEND_METAL
+    const int32_t overlayFirstIndex = cacheFrame ? *overlayIndex : std::numeric_limits<int32_t>::max();
+
     // Upload layer groups
     {
         const auto uploadPass = parameters.encoder->createUploadPass("layerGroup-upload",
@@ -397,8 +421,10 @@ void Renderer::Impl::render(const RenderTree& renderTree, const std::shared_ptr<
         });
     };
 
-    const auto drawableTranslucentPass = [&] {
-        const auto debugGroup(parameters.renderPass->createDebugGroup("drawables-translucent"));
+    // Draws the translucent pass of the layer groups below (`overlay == false`) or from (`true`) the overlay run.
+    const auto drawableTranslucentLayerGroups = [&](const bool overlay) {
+        const auto debugGroup(
+            parameters.renderPass->createDebugGroup(overlay ? "drawables-overlay" : "drawables-translucent"));
         parameters.pass = RenderPass::Translucent;
         parameters.depthRangeSize = 1 - (orchestrator.numLayerGroups() + 2) * PaintParameters::numSublayers *
                                             PaintParameters::depthEpsilon;
@@ -406,11 +432,18 @@ void Renderer::Impl::render(const RenderTree& renderTree, const std::shared_ptr<
         // draw layer groups, translucent pass
         parameters.currentLayer = static_cast<uint32_t>(orchestrator.numLayerGroups()) - 1;
         orchestrator.visitLayerGroups([&](LayerGroupBase& layerGroup) {
-            layerGroup.render(orchestrator, parameters);
+            if ((layerGroup.getLayerIndex() >= overlayFirstIndex) == overlay) {
+                layerGroup.render(orchestrator, parameters);
+            }
             if (parameters.currentLayer > 0) {
                 parameters.currentLayer--;
             }
         });
+    };
+
+    const auto drawableLegacyPass = [&] {
+        const auto debugGroup(parameters.renderPass->createDebugGroup("drawables-legacy"));
+        parameters.pass = RenderPass::Translucent;
 
         // Finally, render any legacy layers which have not been converted to drawables.
         // Note that they may be out of order, this is just a temporary fix for `RenderLocationIndicatorLayer` (#2216)
@@ -446,7 +479,15 @@ void Renderer::Impl::render(const RenderTree& renderTree, const std::shared_ptr<
     commonClearPass();
     context.bindGlobalUniformBuffers(*parameters.renderPass);
     drawableOpaquePass();
-    drawableTranslucentPass();
+    drawableTranslucentLayerGroups(false);
+#if MLN_RENDER_BACKEND_METAL
+    if (cacheFrame) {
+        // The map below the overlay run is now in the layer cache. Continue on the drawable.
+        beginOverlayPass(parameters);
+        drawableTranslucentLayerGroups(true);
+    }
+#endif // MLN_RENDER_BACKEND_METAL
+    drawableLegacyPass();
     drawableDebugOverlays();
 
     // Give the layers a chance to do cleanup
@@ -492,9 +533,130 @@ void Renderer::Impl::render(const RenderTree& renderTree, const std::shared_ptr<
         observer->onDidFinishRenderingMap();
     }
 
+#if MLN_RENDER_BACKEND_METAL
+    overlayReady = cacheFrame && !renderTreeParameters.needsRepaint;
+#endif // MLN_RENDER_BACKEND_METAL
+
     frameCount += 1;
     MLN_END_FRAME();
 }
+
+#if MLN_RENDER_BACKEND_METAL
+void Renderer::Impl::dropRetainedTree() {
+    retainedTree.reset();
+    retainedParameters.reset();
+    overlayReady = false;
+}
+
+bool Renderer::Impl::canRenderOverlay(const std::shared_ptr<UpdateParameters>& updateParameters) {
+    return retainedTree && staticData && retainedParameters == updateParameters &&
+           orchestrator.cachedMapOverlayIndex() &&
+           backend.getDefaultRenderable().getResource<mtl::RenderableResource>().hasLayerCache();
+}
+
+void Renderer::Impl::beginOverlayPass(PaintParameters& parameters) {
+    using CacheStage = mtl::RenderableResource::LayerCacheStage;
+    auto& context = backend.getContext();
+    auto& resource = backend.getDefaultRenderable().getResource<mtl::RenderableResource>();
+
+    if (parameters.renderPass) {
+        context.unbindGlobalUniformBuffers(*parameters.renderPass);
+        parameters.renderPass.reset();
+    }
+
+    resource.setLayerCacheStage(CacheStage::Overlay);
+    parameters.renderPass = parameters.encoder->createRenderPass(
+        "overlay",
+        {.renderable = backend.getDefaultRenderable(), .clearColor = {}, .clearDepth = {}, .clearStencil = {}});
+
+    auto& mtlRenderPass = static_cast<mtl::RenderPass&>(*parameters.renderPass);
+    resource.drawLayerCache(mtlRenderPass.getMetalEncoder());
+    mtlRenderPass.resetState();
+    context.setDirtyState();
+    context.bindGlobalUniformBuffers(*parameters.renderPass);
+}
+
+void Renderer::Impl::renderOverlay(const RenderTree& renderTree,
+                                   const std::shared_ptr<UpdateParameters>& updateParameters) {
+    MLN_TRACE_FUNC();
+    auto& context = backend.getContext();
+    context.setObserver(this);
+
+#if MLN_CREATE_AUTORELEASEPOOL
+    NS::SharedPtr pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+#endif
+
+    const auto overlayIndex = orchestrator.cachedMapOverlayIndex();
+    assert(overlayIndex && staticData);
+
+    backend.getDefaultRenderable().wait();
+    context.beginFrame();
+
+    const auto& renderTreeParameters = renderTree.getParameters();
+    const Size renderableSize = backend.getDefaultRenderable().getSize();
+    const TransformState& state = renderTreeParameters.transformParams.state;
+    const EdgeInsets& frustumOffset = state.getFrustumOffset();
+    const gfx::ScissorRect scissorRect = {
+        .x = static_cast<int32_t>(frustumOffset.left() * pixelRatio),
+        .y = static_cast<int32_t>(frustumOffset.top() * pixelRatio),
+        .width = renderableSize.width -
+                 static_cast<uint32_t>((frustumOffset.left() + frustumOffset.right()) * pixelRatio),
+        .height = renderableSize.height -
+                  static_cast<uint32_t>((frustumOffset.top() + frustumOffset.bottom()) * pixelRatio),
+    };
+
+    PaintParameters parameters{
+        context,
+        pixelRatio,
+        backend,
+        renderTreeParameters.light,
+        renderTreeParameters.mapMode,
+        renderTreeParameters.debugOptions,
+        renderTreeParameters.timePoint,
+        renderTreeParameters.transformParams,
+        *staticData,
+        renderTree.getLineAtlas(),
+        renderTree.getPatternAtlas(),
+        frameCount,
+        updateParameters->tileLodMinRadius,
+        updateParameters->tileLodScale,
+        updateParameters->tileLodPitchThreshold,
+        updateParameters->tileLodMode,
+        renderableSize,
+        scissorRect,
+    };
+    parameters.symbolFadeChange = renderTreeParameters.symbolFadeChange;
+    parameters.opaquePassCutoff = renderTreeParameters.opaquePassCutOff;
+
+    orchestrator.preRenderOverlayLayers(*overlayIndex, context, parameters);
+
+    beginOverlayPass(parameters);
+    {
+        const auto debugGroup(parameters.renderPass->createDebugGroup("drawables-overlay"));
+        parameters.pass = RenderPass::Translucent;
+        parameters.depthRangeSize = 1 - (orchestrator.numLayerGroups() + 2) * PaintParameters::numSublayers *
+                                            PaintParameters::depthEpsilon;
+        parameters.currentLayer = static_cast<uint32_t>(orchestrator.numLayerGroups()) - 1;
+        orchestrator.visitLayerGroups([&](LayerGroupBase& layerGroup) {
+            if (layerGroup.getLayerIndex() >= *overlayIndex) {
+                layerGroup.render(orchestrator, parameters);
+            }
+            if (parameters.currentLayer > 0) {
+                parameters.currentLayer--;
+            }
+        });
+    }
+    context.unbindGlobalUniformBuffers(*parameters.renderPass);
+    parameters.renderPass.reset();
+
+    parameters.encoder->present(backend.getDefaultRenderable());
+    parameters.encoder.reset();
+    context.endFrame();
+
+    frameCount += 1;
+    MLN_END_FRAME();
+}
+#endif // MLN_RENDER_BACKEND_METAL
 
 void Renderer::Impl::reduceMemoryUse() {
     assert(gfx::BackendScope::exists());

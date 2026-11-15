@@ -79,6 +79,10 @@ class MLNCustomLayerHost;
 - (void)drawInMapView:(MLNMapView *)mapView withContext:(MLNStyleLayerDrawingContext)context {
 }
 
+- (BOOL)drawsOverCachedMap {
+  return NO;
+}
+
 - (void)setNeedsDisplay {
   [self.mapView setNeedsRerender];
 }
@@ -102,6 +106,8 @@ public:
       [layer didMoveToMapView:layer.mapView];
     }
   }
+
+  bool drawsOverCachedMap() override { return layer && layer.drawsOverCachedMap; }
 
   void preRender(const mln::gfx::Context &context,
                  const mln::style::CustomLayerRenderParameters &parameters) override {

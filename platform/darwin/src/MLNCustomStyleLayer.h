@@ -57,6 +57,17 @@ MLN_EXPORT
 /// If the layer is not currently part of any style, this property is `nil`.
 @property (nonatomic, weak, readonly) MLNStyle *style;
 
+/// Whether the layer may be redrawn on its own over a cached image of the layers
+/// below it, without the rest of the map being rendered again.
+///
+/// The default is `NO`. Override the getter to return `YES` while the layer only
+/// needs the map's last rendered colour and depth beneath it. It is read after
+/// ``preDrawInMapView:withContext:`` on every frame, and only takes effect for
+/// the run of custom layers at the top of the style that all return `YES`.
+/// While it does, a redraw requested with ``setNeedsDisplay`` when nothing else in
+/// the map changed draws only those layers over the cached map.
+@property (nonatomic, readonly) BOOL drawsOverCachedMap;
+
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 

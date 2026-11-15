@@ -69,10 +69,75 @@ public:
 
   const mln::mtl::MTLRenderPassDescriptorPtr& getRenderPassDescriptor() const override {
     if (!cachedRenderPassDescriptor) {
-      auto* mtlDesc = mtlView.currentRenderPassDescriptor;
+      MTLRenderPassDescriptor* mtlDesc = mtlView.currentRenderPassDescriptor;
+      if (mtlDesc && cacheStage != LayerCacheStage::None) {
+        mtlDesc = [mtlDesc copy];
+        if (cacheStage == LayerCacheStage::Base) {
+          // The map below the overlay layers renders into the cache, colour and depth both kept.
+          mtlDesc.colorAttachments[0].texture = cacheColor;
+          mtlDesc.colorAttachments[0].storeAction = MTLStoreActionStore;
+          mtlDesc.depthAttachment.loadAction = MTLLoadActionClear;
+          mtlDesc.depthAttachment.clearDepth = 1.0;
+          mtlDesc.depthAttachment.storeAction = MTLStoreActionStore;
+          mtlDesc.stencilAttachment.loadAction = MTLLoadActionClear;
+          mtlDesc.stencilAttachment.clearStencil = 0;
+          mtlDesc.stencilAttachment.storeAction = MTLStoreActionStore;
+        } else {
+          // The overlay layers render to the drawable, which `drawLayerCache` fills first, against
+          // the cached depth. Their own depth writes are discarded with the pass.
+          mtlDesc.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+          mtlDesc.colorAttachments[0].storeAction = MTLStoreActionStore;
+          mtlDesc.depthAttachment.loadAction = MTLLoadActionLoad;
+          mtlDesc.depthAttachment.storeAction = MTLStoreActionDontCare;
+          mtlDesc.stencilAttachment.loadAction = MTLLoadActionLoad;
+          mtlDesc.stencilAttachment.storeAction = MTLStoreActionDontCare;
+        }
+        mtlDesc.depthAttachment.texture = cacheDepth;
+        mtlDesc.stencilAttachment.texture = cacheDepth;
+      }
       cachedRenderPassDescriptor = NS::RetainPtr((__bridge MTL::RenderPassDescriptor*)mtlDesc);
     }
     return cachedRenderPassDescriptor;
+  }
+
+  bool setLayerCacheStage(LayerCacheStage stage) override {
+    if (stage == cacheStage) {
+      return true;
+    }
+    if (stage == LayerCacheStage::Base) {
+      if (!prepareLayerCache()) {
+        return false;
+      }
+      cacheFilled = true;
+    } else if (stage == LayerCacheStage::Overlay && !hasLayerCache()) {
+      return false;
+    }
+    cacheStage = stage;
+    cachedRenderPassDescriptor.reset();
+    return true;
+  }
+
+  bool hasLayerCache() const override {
+    return cacheFilled && cacheColor && cacheColor.width == mtlView.drawableSize.width &&
+           cacheColor.height == mtlView.drawableSize.height;
+  }
+
+  void drawLayerCache(const mln::mtl::MTLRenderCommandEncoderPtr& encoderPtr) override {
+    id<MTLRenderCommandEncoder> encoder = (__bridge id<MTLRenderCommandEncoder>)encoderPtr.get();
+    if (!encoder || !cacheColor || !cachePipeline) {
+      return;
+    }
+    [encoder pushDebugGroup:@"layer-cache"];
+    [encoder setRenderPipelineState:cachePipeline];
+    [encoder setFragmentTexture:cacheColor atIndex:0];
+    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [encoder popDebugGroup];
+  }
+
+  void releaseLayerCache() {
+    cacheColor = nil;
+    cacheDepth = nil;
+    cacheFilled = false;
   }
 
   void swap() override {
@@ -99,6 +164,7 @@ public:
     commandBufferPtr.reset();
 
     cachedRenderPassDescriptor.reset();
+    cacheStage = LayerCacheStage::None;
   }
 
   mln::Size framebufferSize() {
@@ -108,9 +174,82 @@ public:
   }
 
 private:
+  /// Makes the cache textures match the drawable and the copy pipeline exist.
+  bool prepareLayerCache() {
+    id<MTLDevice> device = mtlView.device;
+    const auto width = static_cast<NSUInteger>(mtlView.drawableSize.width);
+    const auto height = static_cast<NSUInteger>(mtlView.drawableSize.height);
+    if (!device || !width || !height || mtlView.sampleCount != 1) {
+      return false;
+    }
+
+    if (!cachePipeline && !cachePipelineFailed) {
+      NSString* source = @"#include <metal_stdlib>\n"
+                          "using namespace metal;\n"
+                          "struct Out { float4 position [[position]]; };\n"
+                          "vertex Out layerCacheVertex(uint vid [[vertex_id]]) {\n"
+                          "    float2 p = float2((vid << 1) & 2, vid & 2);\n"
+                          "    Out out;\n"
+                          "    out.position = float4(p * 2.0 - 1.0, 1.0, 1.0);\n"
+                          "    return out;\n"
+                          "}\n"
+                          "fragment float4 layerCacheFragment(Out in [[stage_in]], texture2d<float> t [[texture(0)]]) {\n"
+                          "    return t.read(uint2(in.position.xy));\n"
+                          "}\n";
+      NSError* error = nil;
+      id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
+      MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
+      desc.label = @"layer-cache";
+      desc.vertexFunction = [library newFunctionWithName:@"layerCacheVertex"];
+      desc.fragmentFunction = [library newFunctionWithName:@"layerCacheFragment"];
+      desc.colorAttachments[0].pixelFormat = mtlView.colorPixelFormat;
+      desc.depthAttachmentPixelFormat = mtlView.depthStencilPixelFormat;
+      desc.stencilAttachmentPixelFormat = mtlView.depthStencilPixelFormat;
+      if (library) {
+        cachePipeline = [device newRenderPipelineStateWithDescriptor:desc error:&error];
+      }
+      cachePipelineFailed = !cachePipeline;
+    }
+    if (!cachePipeline) {
+      return false;
+    }
+
+    if (!cacheColor || cacheColor.width != width || cacheColor.height != height) {
+      cacheFilled = false;
+      MTLTextureDescriptor* colorDesc =
+          [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:mtlView.colorPixelFormat
+                                                             width:width
+                                                            height:height
+                                                         mipmapped:NO];
+      colorDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+      colorDesc.storageMode = MTLStorageModePrivate;
+      cacheColor = [device newTextureWithDescriptor:colorDesc];
+      cacheColor.label = @"layer-cache-color";
+
+      MTLTextureDescriptor* depthDesc =
+          [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:mtlView.depthStencilPixelFormat
+                                                             width:width
+                                                            height:height
+                                                         mipmapped:NO];
+      depthDesc.usage = MTLTextureUsageRenderTarget;
+      depthDesc.storageMode = MTLStorageModePrivate;
+      cacheDepth = [device newTextureWithDescriptor:depthDesc];
+      cacheDepth.label = @"layer-cache-depth";
+    }
+    return cacheColor && cacheDepth;
+  }
+
   MLNMapViewMetalImpl& backend;
   mln::mtl::MTLCommandBufferPtr commandBufferPtr;
   mutable mln::mtl::MTLRenderPassDescriptorPtr cachedRenderPassDescriptor;
+
+  // The map below the overlay layers, kept so those layers can be redrawn alone.
+  LayerCacheStage cacheStage = LayerCacheStage::None;
+  id<MTLTexture> cacheColor = nil;
+  id<MTLTexture> cacheDepth = nil;
+  id<MTLRenderPipelineState> cachePipeline = nil;
+  bool cachePipelineFailed = false;
+  bool cacheFilled = false;
 
 public:
   MLNMapViewImplDelegate* delegate = nil;
@@ -205,6 +344,7 @@ UIView* MLNMapViewMetalImpl::getView() {
 void MLNMapViewMetalImpl::deleteView() {
   auto& resource = getResource<MLNMapViewMetalRenderableResource>();
   [resource.mtlView releaseDrawables];
+  resource.releaseLayerCache();
 }
 
 void MLNMapViewMetalImpl::activate() {

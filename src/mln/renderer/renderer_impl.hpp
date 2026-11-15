@@ -16,6 +16,8 @@ namespace mln {
 class RendererObserver;
 class RenderStaticData;
 class RenderTree;
+class PaintParameters;
+class UpdateParameters;
 
 namespace gfx {
 class RendererBackend;
@@ -44,6 +46,16 @@ private:
 
     void reduceMemoryUse();
 
+#if MLN_RENDER_BACKEND_METAL
+    /// Whether the retained tree can be redrawn as cached map plus overlay layers.
+    bool canRenderOverlay(const std::shared_ptr<UpdateParameters>&);
+    /// Redraws only the overlay layers over the cached map.
+    void renderOverlay(const RenderTree&, const std::shared_ptr<UpdateParameters>&);
+    /// Ends the current pass and starts one on the drawable, seeded with the cached map.
+    void beginOverlayPass(PaintParameters&);
+    void dropRetainedTree();
+#endif // MLN_RENDER_BACKEND_METAL
+
     // TODO: Move orchestrator to Map::Impl.
     RenderOrchestrator orchestrator;
 
@@ -68,6 +80,12 @@ private:
 
 #if MLN_RENDER_BACKEND_METAL
     mtl::MTLCaptureScopePtr commandCaptureScope;
+
+    // The last fully rendered tree, kept while its map image is cached and only overlay layers change.
+    // Declared after `orchestrator`, which it refers to, so it is destroyed first.
+    std::unique_ptr<RenderTree> retainedTree;
+    std::shared_ptr<UpdateParameters> retainedParameters;
+    bool overlayReady = false;
 #endif // MLN_RENDER_BACKEND_METAL
 };
 

@@ -25,6 +25,9 @@ Renderer::~Renderer() {
 }
 
 void Renderer::markContextLost() {
+#if MLN_RENDER_BACKEND_METAL
+    impl->dropRetainedTree();
+#endif
     impl->orchestrator.markContextLost();
 }
 
@@ -41,6 +44,19 @@ void Renderer::render(const std::shared_ptr<UpdateParameters>& updateParameters)
     // `SymbolErrorObserver`).
     const ErrorScope errorScope{impl->observer};
 
+#if MLN_RENDER_BACKEND_METAL
+    // Nothing in the map changed since the last full frame and its image is cached: redraw only the
+    // overlay layers over it, skipping the render tree, placement and the map's own drawing.
+    if (impl->canRenderOverlay(updateParameters)) {
+        impl->renderOverlay(*impl->retainedTree, updateParameters);
+        if (!impl->orchestrator.cachedMapOverlayIndex()) {
+            impl->dropRetainedTree();
+        }
+        return;
+    }
+    impl->dropRetainedTree();
+#endif // MLN_RENDER_BACKEND_METAL
+
     const bool styleChanged = impl->styleLoaded && !updateParameters->styleLoaded;
     impl->styleLoaded = updateParameters->styleLoaded;
     if (!impl->dynamicTextureAtlas || styleChanged) {
@@ -50,6 +66,12 @@ void Renderer::render(const std::shared_ptr<UpdateParameters>& updateParameters)
     if (auto renderTree = impl->orchestrator.createRenderTree(updateParameters, impl->dynamicTextureAtlas)) {
         renderTree->prepare();
         impl->render(*renderTree, updateParameters);
+#if MLN_RENDER_BACKEND_METAL
+        if (impl->overlayReady) {
+            impl->retainedTree = std::move(renderTree);
+            impl->retainedParameters = updateParameters;
+        }
+#endif // MLN_RENDER_BACKEND_METAL
     }
 }
 
@@ -120,6 +142,9 @@ void Renderer::setFeatureState(const std::string& sourceID,
                                const std::optional<std::string>& sourceLayerID,
                                const std::string& featureID,
                                const FeatureState& state) {
+#if MLN_RENDER_BACKEND_METAL
+    impl->dropRetainedTree();
+#endif
     impl->orchestrator.setFeatureState(sourceID, sourceLayerID, featureID, state);
 }
 
@@ -142,6 +167,9 @@ void Renderer::removeFeatureState(const std::string& sourceID,
                                   const std::optional<std::string>& sourceLayerID,
                                   const std::optional<std::string>& featureID,
                                   const std::optional<std::string>& stateKey) {
+#if MLN_RENDER_BACKEND_METAL
+    impl->dropRetainedTree();
+#endif
     impl->orchestrator.removeFeatureState(sourceID, sourceLayerID, featureID, stateKey);
 }
 
@@ -158,6 +186,9 @@ const std::vector<PlacedSymbolData>& Renderer::getPlacedSymbolsData() const {
 }
 
 void Renderer::setTileCacheEnabled(bool enable) {
+#if MLN_RENDER_BACKEND_METAL
+    impl->dropRetainedTree();
+#endif
     impl->orchestrator.setTileCacheEnabled(enable);
 }
 
@@ -167,11 +198,17 @@ bool Renderer::getTileCacheEnabled() const {
 
 void Renderer::reduceMemoryUse() {
     gfx::BackendScope guard{impl->backend};
+#if MLN_RENDER_BACKEND_METAL
+    impl->dropRetainedTree();
+#endif
     impl->reduceMemoryUse();
     impl->orchestrator.reduceMemoryUse();
 }
 
 void Renderer::clearData() {
+#if MLN_RENDER_BACKEND_METAL
+    impl->dropRetainedTree();
+#endif
     impl->orchestrator.clearData();
 }
 

@@ -18,6 +18,7 @@
 
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -165,6 +166,13 @@ public:
     }
 
     const ZoomHistory& getZoomHistory() const { return zoomHistory; }
+
+    /// The layer index of the lowest layer in the run of custom layers at the top of the style
+    /// that allow being redrawn over a cached image of the layers below, if there is such a run.
+    std::optional<int32_t> cachedMapOverlayIndex() const;
+
+    /// Calls pre-render on the custom layers at or above the given layer index.
+    void preRenderOverlayLayers(int32_t firstIndex, gfx::Context&, const PaintParameters&);
 
 private:
     bool isLoaded() const;
