@@ -5,6 +5,13 @@
 #include <mln/renderer/render_tile.hpp>
 #include <mln/tile/tile.hpp>
 #include <mln/util/instrumentation.hpp>
+#include <mln/util/logging.hpp>
+
+#include <atomic>
+
+#ifndef MLN_VERIFY_SYMBOL_SKIPS
+#define MLN_VERIFY_SYMBOL_SKIPS 0
+#endif
 
 namespace mln {
 
@@ -100,9 +107,17 @@ void CrossTileSymbolLayerIndex::handleWrapJump(float newLng) {
         }
 
         indexes = std::move(newIndexes);
+        markChanged();
     }
 
     lng = newLng;
+}
+
+void CrossTileSymbolLayerIndex::markChanged() {
+    // One counter for every index (and every renderer), so a value is never reused, even by an index
+    // created after another one was pruned.
+    static std::atomic<uint64_t> lastGeneration{0};
+    generation = ++lastGeneration;
 }
 
 namespace {
@@ -119,6 +134,22 @@ bool isInVewport(const mat4& posMatrix, const Point<float>& point) {
     return (x > -edge && y > -edge && x < edge && y < edge);
 }
 
+// Whether every symbol of an overscaled bucket has a cross-tile ID exactly when it is in the
+// viewport, which is how `addBucket` would set the bucket up again for this tile matrix.
+bool viewportMatchesCrossTileIDs(const OverscaledTileID& tileID, const mat4& tileMatrix, const SymbolBucket& bucket) {
+    if (tileID.overscaleFactor() <= 1u) {
+        return false;
+    }
+    for (const auto& symbolInstance : bucket.symbolInstances) {
+        const bool indexed = symbolInstance.check(SYM_GUARD_LOC) &&
+                             isInVewport(tileMatrix, symbolInstance.getAnchor().point);
+        if (indexed != (symbolInstance.getCrossTileID() != SymbolInstance::invalidCrossTileID)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 bool CrossTileSymbolLayerIndex::addBucket(const OverscaledTileID& tileID,
@@ -126,17 +157,36 @@ bool CrossTileSymbolLayerIndex::addBucket(const OverscaledTileID& tileID,
                                           SymbolBucket& bucket) {
     auto& thisZoomIndexes = indexes[tileID.overscaledZ];
     auto previousIndex = thisZoomIndexes.find(tileID);
-    if (previousIndex != thisZoomIndexes.end()) {
-        if (previousIndex->second.bucketInstanceId == bucket.bucketInstanceId && !bucket.hasUninitializedSymbols) {
-            return false;
-        } else {
-            // We're replacing this bucket with an updated version
-            // Remove the old bucket's "used crossTileIDs" now so that the new
-            // bucket can claim them. We have to keep the old index entries
-            // themselves until the end of 'addBucket' so that we can copy them
-            // with 'findMatches'.
-            removeBucketCrossTileIDs(tileID.overscaledZ, previousIndex->second);
+    const bool sameBucket = previousIndex != thisZoomIndexes.end() &&
+                            previousIndex->second.bucketInstanceId == bucket.bucketInstanceId;
+    if (sameBucket && !bucket.hasUninitializedSymbols) {
+        return false;
+    }
+    const bool canSkip = sameBucket && previousIndex->second.settled &&
+                         previousIndex->second.indexedGeneration == generation &&
+                         viewportMatchesCrossTileIDs(tileID, tileMatrix, bucket);
+#if !MLN_VERIFY_SYMBOL_SKIPS
+    if (canSkip) {
+        // Nothing indexing reads has changed since this bucket was last indexed, and that indexing
+        // kept every ID, so doing it again would give every symbol the ID it already has.
+        // Report the bucket as re-added, as indexing it again does.
+        return true;
+    }
+#endif
+    std::vector<uint32_t> previousIDs;
+    if (sameBucket) {
+        previousIDs.reserve(bucket.symbolInstances.size());
+        for (const auto& symbolInstance : bucket.symbolInstances) {
+            previousIDs.push_back(symbolInstance.getCrossTileID());
         }
+    }
+    if (previousIndex != thisZoomIndexes.end()) {
+        // We're replacing this bucket with an updated version
+        // Remove the old bucket's "used crossTileIDs" now so that the new
+        // bucket can claim them. We have to keep the old index entries
+        // themselves until the end of 'addBucket' so that we can copy them
+        // with 'findMatches'.
+        removeBucketCrossTileIDs(tileID.overscaledZ, previousIndex->second);
     }
 
     bucket.hasUninitializedSymbols = false;
@@ -186,11 +236,40 @@ bool CrossTileSymbolLayerIndex::addBucket(const OverscaledTileID& tileID,
         }
     }
 
+    bool settled = sameBucket;
+    for (std::size_t i = 0; settled && i < previousIDs.size(); ++i) {
+        settled = bucket.symbolInstances[i].getCrossTileID() == previousIDs[i];
+    }
+#if MLN_VERIFY_SYMBOL_SKIPS
+    static uint64_t verifyCalls = 0;
+    static uint64_t verifySkips = 0;
+    static uint64_t verifyStale = 0;
+    if (canSkip) {
+        ++verifySkips;
+    }
+    if (canSkip && !settled) {
+        ++verifyStale;
+        Log::Error(Event::General, "Cross-tile skip would have kept stale IDs");
+    }
+    if (++verifyCalls % 2000 == 0) {
+        Log::Info(Event::General,
+                  "Cross-tile skip check: calls " + std::to_string(verifyCalls) + ", skips checked " +
+                      std::to_string(verifySkips) + ", stale " + std::to_string(verifyStale));
+    }
+#endif
+    if (!settled) {
+        markChanged();
+    }
+
     thisZoomIndexes.erase(tileID);
-    thisZoomIndexes.emplace(
-        std::piecewise_construct,
-        std::forward_as_tuple(tileID),
-        std::forward_as_tuple(tileID, bucket.symbolInstances, bucket.bucketInstanceId, bucket.bucketLeaderID));
+    auto& index = thisZoomIndexes
+                      .emplace(std::piecewise_construct,
+                               std::forward_as_tuple(tileID),
+                               std::forward_as_tuple(
+                                   tileID, bucket.symbolInstances, bucket.bucketInstanceId, bucket.bucketLeaderID))
+                      .first->second;
+    index.indexedGeneration = generation;
+    index.settled = settled;
     return true;
 }
 
@@ -210,6 +289,7 @@ bool CrossTileSymbolLayerIndex::removeStaleBuckets(const std::unordered_set<uint
                 removeBucketCrossTileIDs(zoomIndexes.first, it->second);
                 it = zoomIndexes.second.erase(it);
                 tilesChanged = true;
+                markChanged();
             } else {
                 ++it;
             }
@@ -267,6 +347,11 @@ void CrossTileSymbolIndex::pruneUnusedLayers(const std::set<std::string>& usedLa
 
 void CrossTileSymbolIndex::reset() {
     layerIndexes.clear();
+}
+
+uint64_t CrossTileSymbolIndex::layerGeneration(const std::string& layerID) const {
+    const auto found = layerIndexes.find(layerID);
+    return found == layerIndexes.end() ? 0 : found->second.getGeneration();
 }
 
 } // namespace mln

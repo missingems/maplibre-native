@@ -72,6 +72,7 @@ public:
     std::vector<Feature> queryRenderedFeatures(const ScreenLineString&, const RenderedQueryOptions&) const;
     std::vector<Feature> querySourceFeatures(const std::string& sourceID, const SourceQueryOptions&) const;
     std::vector<Feature> queryShapeAnnotations(const ScreenLineString&) const;
+    AnnotationIDs queryPointAnnotations(const ScreenLineString&) const;
 
     FeatureExtensionValue queryFeatureExtensions(const std::string& sourceID,
                                                  const Feature& feature,
@@ -229,6 +230,18 @@ private:
 
     CrossTileSymbolIndex crossTileSymbolIndex;
     PlacementController placementController;
+
+    // Point annotation query results depend only on the committed placement and the
+    // query geometry, so they are reused until either changes. The placement is
+    // identified by a counter that never repeats, so the cache does not keep a
+    // replaced placement alive and cannot confuse it with a new one at the same address.
+    uint64_t placementGeneration = 0;
+    struct PointAnnotationQuery {
+        uint64_t placementGeneration;
+        ScreenLineString geometry;
+        AnnotationIDs ids;
+    };
+    mutable std::optional<PointAnnotationQuery> pointAnnotationQuery;
 
     const bool backgroundLayerAsColor;
     bool contextLost = false;

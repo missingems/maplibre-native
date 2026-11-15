@@ -31,6 +31,8 @@
 #include <mln/util/logging.hpp>
 
 #include <algorithm>
+#include <limits>
+#include <set>
 
 namespace mln {
 
@@ -509,6 +511,7 @@ std::unique_ptr<RenderTree> RenderOrchestrator::createRenderTree(
             Mutable<Placement> placement = Placement::create(updateParameters, placementController.getPlacement());
             placement->placeLayers(layersNeedPlacement);
             placementController.setPlacement(std::move(placement));
+            ++placementGeneration;
             crossTileSymbolIndex.pruneUnusedLayers(usedSymbolLayers);
             for (const auto& entry : renderSources) {
                 entry.second->updateFadingTiles();
@@ -528,6 +531,7 @@ std::unique_ptr<RenderTree> RenderOrchestrator::createRenderTree(
             placement->collectPlacedSymbolData(placedSymbolDataCollected);
             placement->placeLayers(layersNeedPlacement);
             placementController.setPlacement(std::move(placement));
+            ++placementGeneration;
         }
         crossTileSymbolIndex.reset();
         renderTreeParameters->symbolFadeChange = 1.0f;
@@ -700,6 +704,40 @@ std::vector<Feature> RenderOrchestrator::queryShapeAnnotations(const ScreenLineS
     return queryRenderedFeatures(geometry, options, shapeAnnotationLayers);
 }
 
+AnnotationIDs RenderOrchestrator::queryPointAnnotations(const ScreenLineString& geometry) const {
+    MLN_TRACE_FUNC();
+
+    // Symbol layers add nothing to the tile feature index or the dynamic feature index,
+    // so the result is a function of the committed placement and the geometry alone.
+    const RenderLayer* layer = getRenderLayer(AnnotationManager::PointLayerID);
+    const bool cacheable = layer && layer->needsRendering() && layer->supportsZoom(zoomHistory.lastZoom) &&
+                           layer->baseImpl->getTypeInfo()->crossTileIndex ==
+                               style::LayerTypeInfo::CrossTileIndex::Required;
+    const bool hit = cacheable && pointAnnotationQuery &&
+                     pointAnnotationQuery->placementGeneration == placementGeneration &&
+                     pointAnnotationQuery->geometry == geometry;
+    if (hit) {
+        return pointAnnotationQuery->ids;
+    }
+
+    RenderedQueryOptions options;
+    options.layerIDs = {{AnnotationManager::PointLayerID}};
+    std::set<AnnotationID> unique;
+    for (const auto& feature : queryRenderedFeatures(geometry, options)) {
+        assert(feature.id.is<uint64_t>());
+        assert(feature.id.get<uint64_t>() <= std::numeric_limits<AnnotationID>::max());
+        unique.insert(static_cast<AnnotationID>(feature.id.get<uint64_t>()));
+    }
+    AnnotationIDs ids(unique.begin(), unique.end());
+
+    if (cacheable) {
+        pointAnnotationQuery.emplace(PointAnnotationQuery{placementGeneration, geometry, ids});
+    } else {
+        pointAnnotationQuery.reset();
+    }
+    return ids;
+}
+
 std::vector<Feature> RenderOrchestrator::querySourceFeatures(const std::string& sourceID,
                                                              const SourceQueryOptions& options) const {
     MLN_TRACE_FUNC();
@@ -772,6 +810,7 @@ bool RenderOrchestrator::getTileCacheEnabled() const {
 void RenderOrchestrator::reduceMemoryUse() {
     MLN_TRACE_FUNC();
 
+    pointAnnotationQuery.reset();
     filteredLayersForSource.shrink_to_fit();
     for (const auto& entry : renderSources) {
         entry.second->reduceMemoryUse();
@@ -857,6 +896,7 @@ bool RenderOrchestrator::isLoaded() const {
 void RenderOrchestrator::clearData() {
     MLN_TRACE_FUNC();
 
+    pointAnnotationQuery.reset();
     if (!sourceImpls->empty()) sourceImpls = makeMutable<std::vector<Immutable<style::Source::Impl>>>();
     if (!layerImpls->empty()) layerImpls = makeMutable<std::vector<Immutable<style::Layer::Impl>>>();
     if (!imageImpls->empty()) imageImpls = makeMutable<std::vector<Immutable<style::Image::Impl>>>();

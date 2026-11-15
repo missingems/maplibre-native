@@ -94,10 +94,8 @@ AnnotationIDs Renderer::queryPointAnnotations(const ScreenBox& box) const {
     if (!LayerManager::annotationsEnabled) {
         return {};
     }
-    RenderedQueryOptions options;
-    options.layerIDs = {{AnnotationManager::PointLayerID}};
-    auto features = queryRenderedFeatures(box, options);
-    return getAnnotationIDs(features);
+    return impl->orchestrator.queryPointAnnotations(
+        {box.min, {box.max.x, box.min.y}, box.max, {box.min.x, box.max.y}, box.min});
 }
 
 AnnotationIDs Renderer::queryShapeAnnotations(const ScreenBox& box) const {

@@ -8,10 +8,17 @@
 #include <mln/renderer/update_parameters.hpp>
 #include <mln/tile/geometry_tile.hpp>
 #include <mln/util/instrumentation.hpp>
+#include <mln/util/logging.hpp>
 #include <mln/util/math.hpp>
 
+#include <array>
+#include <cstdint>
 #include <list>
 #include <utility>
+
+#ifndef MLN_VERIFY_SYMBOL_SKIPS
+#define MLN_VERIFY_SYMBOL_SKIPS 0
+#endif
 
 namespace mln {
 
@@ -663,23 +670,61 @@ SymbolInstanceReferences Placement::getSortedSymbols(const BucketPlacementData& 
     SymbolInstanceReferences sortedSymbols = getBucketSymbols(
         bucket, params.sortKeyRange, collisionIndex.getTransformState().getBearing());
     auto* previousPlacement = getPrevPlacement();
-    if (previousPlacement && isTiltedView()) {
-        std::stable_sort(sortedSymbols.begin(),
-                         sortedSymbols.end(),
-                         [previousPlacement](const SymbolInstance& a, const SymbolInstance& b) noexcept {
-                             auto* aPlacement = previousPlacement->getSymbolPlacement(a);
-                             auto* bPlacement = previousPlacement->getSymbolPlacement(b);
-                             if (!aPlacement) {
-                                 // a < b, if 'a' is new and if 'b' was previously hidden.
-                                 return bPlacement && !bPlacement->placed();
-                             }
-                             if (!bPlacement) {
-                                 // a < b, if 'b' is new and 'a' was previously shown.
-                                 return aPlacement->placed();
-                             }
-                             // a < b, if 'a' was shown and 'b' was hidden.
-                             return aPlacement->placed() && !bPlacement->placed();
-                         });
+    if (previousPlacement && isTiltedView() && sortedSymbols.size() > 1) {
+        // Symbols the previous placement showed come first, then new ones, then the ones it hid,
+        // each group keeping its order. This is the order a stable sort on that rule gives, without
+        // looking up the previous placement in every comparison.
+        constexpr uint8_t shown = 0, added = 1, hidden = 2;
+        std::vector<uint8_t> ranks;
+        ranks.reserve(sortedSymbols.size());
+        std::array<std::size_t, 3> counts{};
+        for (const SymbolInstance& symbol : sortedSymbols) {
+            const auto* placement = previousPlacement->getSymbolPlacement(symbol);
+            const uint8_t rank = placement ? (placement->placed() ? shown : hidden) : added;
+            ranks.push_back(rank);
+            ++counts[rank];
+        }
+        if (counts[shown] != sortedSymbols.size() && counts[added] != sortedSymbols.size() &&
+            counts[hidden] != sortedSymbols.size()) {
+            SymbolInstanceReferences ordered;
+            ordered.reserve(sortedSymbols.size());
+            for (uint8_t rank = shown; rank <= hidden; ++rank) {
+                for (std::size_t i = 0; i < sortedSymbols.size(); ++i) {
+                    if (ranks[i] == rank) {
+                        ordered.push_back(sortedSymbols[i]);
+                    }
+                }
+            }
+#if MLN_VERIFY_SYMBOL_SKIPS
+            SymbolInstanceReferences reference = sortedSymbols;
+            std::stable_sort(reference.begin(),
+                             reference.end(),
+                             [previousPlacement](const SymbolInstance& a, const SymbolInstance& b) noexcept {
+                                 auto* aPlacement = previousPlacement->getSymbolPlacement(a);
+                                 auto* bPlacement = previousPlacement->getSymbolPlacement(b);
+                                 if (!aPlacement) return bPlacement && !bPlacement->placed();
+                                 if (!bPlacement) return aPlacement->placed();
+                                 return aPlacement->placed() && !bPlacement->placed();
+                             });
+            static uint64_t verifySorts = 0;
+            static uint64_t verifySymbols = 0;
+            static uint64_t verifyDiffers = 0;
+            verifySymbols += reference.size();
+            for (std::size_t i = 0; i < reference.size(); ++i) {
+                if (&reference[i].get() != &ordered[i].get()) {
+                    ++verifyDiffers;
+                    Log::Error(Event::General, "Tilted symbol order differs from the stable sort");
+                    break;
+                }
+            }
+            if (++verifySorts % 200 == 0) {
+                Log::Info(Event::General,
+                          "Tilted sort check: sorts " + std::to_string(verifySorts) + ", symbols " +
+                              std::to_string(verifySymbols) + ", differs " + std::to_string(verifyDiffers));
+            }
+#endif
+            sortedSymbols = std::move(ordered);
+        }
     }
     return sortedSymbols;
 }
